@@ -623,6 +623,8 @@ Survey reference titles (cleaned):
         aspects = base.get("aspects") if isinstance(base, dict) else None
         numeric_scores = []
         if isinstance(aspects, list):
+            # Filter out non-dict elements (LLM may return malformed items)
+            aspects = [a for a in aspects if isinstance(a, dict)]
             numeric_scores = [
                 a.get("score") for a in aspects if isinstance(a.get("score"), (int, float))
             ]

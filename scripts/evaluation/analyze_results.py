@@ -156,6 +156,19 @@ class EvaluationResultsAnalyzer:
                             results.append(file_scores.get(aspect))
         return results
 
+    def _iter_diagnostic_data(self) -> List[Any]:
+        """Iterate over diagnostic data entries for all aspects."""
+        results: List[Any] = []
+        by_system = self.data.get("by_system", {})
+        for _, categories in by_system.items():
+            for _, cat_data in categories.items():
+                files = cat_data.get("files", [])
+                for file_entry in files:
+                    diagnostics = file_entry.get("diagnostics", {})
+                    for aspect in ["outline", "content", "reference"]:
+                        results.append(diagnostics.get(aspect))
+        return results
+
     def _scan_score_formats(self) -> None:
         """Detect whether results contain float scores or AMS dict scores."""
         for score_data in self._iter_score_data():
@@ -166,7 +179,7 @@ class EvaluationResultsAnalyzer:
             elif isinstance(score_data, dict):
                 if any(
                     isinstance(score_data.get(k), (int, float))
-                    for k in ["f1", "precision", "recall", "thresholded_ams"]
+                    for k in ["f1", "precision", "recall", "thresholded_ams", "bms", "t_ams"]
                 ):
                     self.has_ams_dict_scores = True
 
@@ -182,11 +195,32 @@ class EvaluationResultsAnalyzer:
                 metrics.add("ams")
                 continue
             if isinstance(score_data, dict):
-                for key in ["f1", "precision", "recall", "thresholded_ams"]:
+                for key in ["f1", "precision", "recall", "thresholded_ams", "bms", "t_ams"]:
                     if isinstance(score_data.get(key), (int, float)):
                         metrics.add(key)
-        ordered = ["f1", "precision", "recall", "thresholded_ams", "ams"]
+        ordered = ["f1", "precision", "recall", "thresholded_ams", "bms", "t_ams", "ams"]
         return [m for m in ordered if m in metrics]
+
+    def _detect_available_diagnostics(self) -> List[str]:
+        """Detect which diagnostic metrics are present in the data."""
+        metrics = set()
+        for diag_data in self._iter_diagnostic_data():
+            if not isinstance(diag_data, dict):
+                continue
+            for key, value in diag_data.items():
+                if isinstance(value, (int, float)):
+                    metrics.add(key)
+        ordered = ["t_ams", "redundancy", "dup_rate"]
+        return [m for m in ordered if m in metrics] + sorted(m for m in metrics if m not in ordered)
+
+    def _extract_diagnostic_value(self, diag_data: Any, metric: str) -> Optional[float]:
+        """Extract a numeric diagnostic metric value."""
+        if not isinstance(diag_data, dict):
+            return None
+        value = diag_data.get(metric)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
     
     def _extract_score(self, score_data: Any) -> Optional[float]:
         """
@@ -218,7 +252,7 @@ class EvaluationResultsAnalyzer:
             score = score_data.get("score")
             if isinstance(score, (int, float)):
                 return score
-            # AMS quantitative format (dict with precision/recall/f1/thresholded_ams)
+            # AMS quantitative format (dict with precision/recall/f1/thresholded_ams/bms/t_ams)
             metric_value = score_data.get(self.ams_metric)
             if isinstance(metric_value, (int, float)):
                 return metric_value
@@ -470,6 +504,183 @@ class EvaluationResultsAnalyzer:
             result["average"] = None
         
         return result
+
+    def aggregate_diagnostics_by_system(self, metric: str) -> List[Dict[str, Any]]:
+        """Aggregate diagnostic metrics by system."""
+        results = []
+        by_system = self.data.get("by_system", {})
+
+        for system, categories in by_system.items():
+            scores_sum = defaultdict(float)
+            scores_count = defaultdict(int)
+            total_files = 0
+
+            for _, cat_data in categories.items():
+                files = cat_data.get("files", [])
+                total_files += len(files)
+
+                for file_entry in files:
+                    diagnostics = file_entry.get("diagnostics", {})
+                    for aspect in ["outline", "content", "reference"]:
+                        value = self._extract_diagnostic_value(diagnostics.get(aspect), metric)
+                        if value is not None:
+                            scores_sum[aspect] += value
+                            scores_count[aspect] += 1
+
+            result = {"system": system, "count": total_files}
+            for aspect in ["outline", "content", "reference"]:
+                if scores_count[aspect] > 0:
+                    result[aspect] = round(scores_sum[aspect] / scores_count[aspect], 3)
+                else:
+                    result[aspect] = None
+
+            valid_scores = [
+                v for k, v in result.items()
+                if k in ["outline", "content", "reference"] and v is not None
+            ]
+            result["average"] = round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None
+            results.append(result)
+
+        return sorted(results, key=lambda x: x["system"])
+
+    def aggregate_diagnostics_by_category(self, metric: str) -> List[Dict[str, Any]]:
+        """Aggregate diagnostic metrics by category."""
+        category_scores_sum = defaultdict(lambda: defaultdict(float))
+        category_scores_count = defaultdict(lambda: defaultdict(int))
+        category_counts = defaultdict(int)
+
+        by_system = self.data.get("by_system", {})
+
+        for _, categories in by_system.items():
+            for category, cat_data in categories.items():
+                files = cat_data.get("files", [])
+                category_counts[category] += len(files)
+
+                for file_entry in files:
+                    diagnostics = file_entry.get("diagnostics", {})
+                    for aspect in ["outline", "content", "reference"]:
+                        value = self._extract_diagnostic_value(diagnostics.get(aspect), metric)
+                        if value is not None:
+                            category_scores_sum[category][aspect] += value
+                            category_scores_count[category][aspect] += 1
+
+        results = []
+        for category in sorted(category_scores_sum.keys()):
+            result = {"category": category, "count": category_counts[category]}
+            for aspect in ["outline", "content", "reference"]:
+                if category_scores_count[category][aspect] > 0:
+                    total = category_scores_sum[category][aspect]
+                    count = category_scores_count[category][aspect]
+                    result[aspect] = round(total / count, 3)
+                else:
+                    result[aspect] = None
+
+            valid_scores = [
+                v for k, v in result.items()
+                if k in ["outline", "content", "reference"] and v is not None
+            ]
+            result["average"] = round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None
+            results.append(result)
+
+        return results
+
+    def aggregate_diagnostics_by_system_category(self, metric: str) -> List[Dict[str, Any]]:
+        """Aggregate diagnostic metrics by system-category combination."""
+        results = []
+        by_system = self.data.get("by_system", {})
+
+        for system, categories in by_system.items():
+            for category, cat_data in categories.items():
+                files = cat_data.get("files", [])
+                scores_sum = defaultdict(float)
+                scores_count = defaultdict(int)
+
+                for file_entry in files:
+                    diagnostics = file_entry.get("diagnostics", {})
+                    for aspect in ["outline", "content", "reference"]:
+                        value = self._extract_diagnostic_value(diagnostics.get(aspect), metric)
+                        if value is not None:
+                            scores_sum[aspect] += value
+                            scores_count[aspect] += 1
+
+                result = {"system": system, "category": category, "count": len(files)}
+                for aspect in ["outline", "content", "reference"]:
+                    if scores_count[aspect] > 0:
+                        result[aspect] = round(scores_sum[aspect] / scores_count[aspect], 3)
+                    else:
+                        result[aspect] = None
+
+                valid_scores = [
+                    v for k, v in result.items()
+                    if k in ["outline", "content", "reference"] and v is not None
+                ]
+                result["average"] = round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None
+                results.append(result)
+
+        return sorted(results, key=lambda x: (x["system"], x["category"]))
+
+    def aggregate_diagnostics_overall(self, metric: str) -> Dict[str, Any]:
+        """Aggregate diagnostic metrics across all systems and categories."""
+        scores_sum = defaultdict(float)
+        scores_count = defaultdict(int)
+        total_files = 0
+
+        by_system = self.data.get("by_system", {})
+
+        for _, categories in by_system.items():
+            for _, cat_data in categories.items():
+                files = cat_data.get("files", [])
+                total_files += len(files)
+
+                for file_entry in files:
+                    diagnostics = file_entry.get("diagnostics", {})
+                    for aspect in ["outline", "content", "reference"]:
+                        value = self._extract_diagnostic_value(diagnostics.get(aspect), metric)
+                        if value is not None:
+                            scores_sum[aspect] += value
+                            scores_count[aspect] += 1
+
+        result = {"count": total_files}
+        for aspect in ["outline", "content", "reference"]:
+            if scores_count[aspect] > 0:
+                result[aspect] = round(scores_sum[aspect] / scores_count[aspect], 3)
+            else:
+                result[aspect] = None
+
+        valid_scores = [
+            v for k, v in result.items()
+            if k in ["outline", "content", "reference"] and v is not None
+        ]
+        result["average"] = round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None
+        return result
+
+    def get_detailed_diagnostics(self, metric: str) -> List[Dict[str, Any]]:
+        """Get per-file diagnostic metrics for each aspect."""
+        results = []
+        by_system = self.data.get("by_system", {})
+
+        for system, categories in by_system.items():
+            for category, cat_data in categories.items():
+                files = cat_data.get("files", [])
+                for file_entry in files:
+                    diagnostics = file_entry.get("diagnostics", {})
+                    result = {
+                        "system": system,
+                        "category": category,
+                        "file": file_entry.get("file", ""),
+                    }
+                    for aspect in ["outline", "content", "reference"]:
+                        value = self._extract_diagnostic_value(diagnostics.get(aspect), metric)
+                        result[aspect] = value
+
+                    valid_scores = [
+                        v for k, v in result.items()
+                        if k in ["outline", "content", "reference"] and v is not None
+                    ]
+                    result["average"] = round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None
+                    results.append(result)
+
+        return results
     
     def get_detailed_results(self) -> List[Dict[str, Any]]:
         """
@@ -638,6 +849,28 @@ class EvaluationResultsAnalyzer:
             detailed = self.get_detailed_results()
             self.export_to_csv(detailed, output_dir / f"detailed_results{suffix}.csv")
 
+        diagnostic_metrics = self._detect_available_diagnostics()
+        for diag_metric in diagnostic_metrics:
+            suffix = f"_{diag_metric}" if len(diagnostic_metrics) > 1 else ""
+
+            by_system = self.aggregate_diagnostics_by_system(diag_metric)
+            self.export_to_csv(by_system, output_dir / f"diagnostics_by_system{suffix}.csv")
+
+            by_category = self.aggregate_diagnostics_by_category(diag_metric)
+            self.export_to_csv(by_category, output_dir / f"diagnostics_by_category{suffix}.csv")
+
+            by_sys_cat = self.aggregate_diagnostics_by_system_category(diag_metric)
+            self.export_to_csv(
+                by_sys_cat,
+                output_dir / f"diagnostics_by_system_category{suffix}.csv",
+            )
+
+            overall = self.aggregate_diagnostics_overall(diag_metric)
+            self.export_to_csv([overall], output_dir / f"diagnostics_overall{suffix}.csv")
+
+            detailed = self.get_detailed_diagnostics(diag_metric)
+            self.export_to_csv(detailed, output_dir / f"diagnostics_detailed{suffix}.csv")
+
         if self.eval_type == "qualitative":
             # Export aspect-level averages (per-aspect/per-criterion scoring)
             aspect_results = self.get_aspect_level_results()
@@ -645,6 +878,44 @@ class EvaluationResultsAnalyzer:
 
         self.ams_metric = original_metric
         logger.info(f"Exported all aggregations to {output_dir}")
+
+    def export_diagnostics(self, output_dir: str) -> None:
+        """
+        Export diagnostics aggregations to separate CSV files.
+
+        Args:
+            output_dir: Base directory to save CSV files (will create timestamped subdirectory)
+        """
+        output_dir = Path(output_dir) / f"analysis_{self.eval_type}_{self.timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        diagnostic_metrics = self._detect_available_diagnostics()
+        if not diagnostic_metrics:
+            logger.warning("No diagnostic metrics detected; nothing to export.")
+            return
+
+        for diag_metric in diagnostic_metrics:
+            suffix = f"_{diag_metric}" if len(diagnostic_metrics) > 1 else ""
+
+            by_system = self.aggregate_diagnostics_by_system(diag_metric)
+            self.export_to_csv(by_system, output_dir / f"diagnostics_by_system{suffix}.csv")
+
+            by_category = self.aggregate_diagnostics_by_category(diag_metric)
+            self.export_to_csv(by_category, output_dir / f"diagnostics_by_category{suffix}.csv")
+
+            by_sys_cat = self.aggregate_diagnostics_by_system_category(diag_metric)
+            self.export_to_csv(
+                by_sys_cat,
+                output_dir / f"diagnostics_by_system_category{suffix}.csv",
+            )
+
+            overall = self.aggregate_diagnostics_overall(diag_metric)
+            self.export_to_csv([overall], output_dir / f"diagnostics_overall{suffix}.csv")
+
+            detailed = self.get_detailed_diagnostics(diag_metric)
+            self.export_to_csv(detailed, output_dir / f"diagnostics_detailed{suffix}.csv")
+
+        logger.info(f"Exported diagnostics aggregations to {output_dir}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -662,13 +933,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--aggregation",
-        choices=["system", "category", "system-category", "overall", "detailed", "aspect", "all"],
+        choices=["system", "category", "system-category", "overall", "detailed", "aspect", "diagnostics", "all"],
         default="all",
         help="Type of aggregation to perform (default: all)"
     )
     parser.add_argument(
         "--ams-metric",
-        choices=["f1", "precision", "recall", "thresholded_ams"],
+        choices=["f1", "precision", "recall", "thresholded_ams", "bms", "t_ams"],
         default="f1",
         help="When scores are AMS dicts, which metric to aggregate (default: f1)"
     )
@@ -701,6 +972,11 @@ def main():
     
     if args.aggregation == "all":
         analyzer.export_all(args.output_dir)
+        output_location = Path(args.output_dir) / f"analysis_{analyzer.eval_type}_{analyzer.timestamp}"
+    elif args.aggregation == "diagnostics":
+        if args.output_file:
+            logger.warning("--output-file is ignored for diagnostics aggregation.")
+        analyzer.export_diagnostics(args.output_dir)
         output_location = Path(args.output_dir) / f"analysis_{analyzer.eval_type}_{analyzer.timestamp}"
     else:
         # Determine output file

@@ -190,6 +190,8 @@ def main() -> None:
 
     print(f"Merged results saved to {output_dir}")
 
+# use case: python merge_results.py results/analysis/analysis_* --output-dir results/analysis/merged
+
 
 if __name__ == "__main__":
     main()

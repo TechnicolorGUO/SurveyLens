@@ -1,0 +1,18 @@
+{
+  "input_dir": "results/processed/Human",
+  "output_dir": "results/evaluation",
+  "categories": null,
+  "double_round_robin": true,
+  "max_tokens_per_input": 32768,
+  "eval_outline": true,
+  "eval_content": true,
+  "eval_reference": true,
+  "initial_elo": 1500.0,
+  "k_factor": 32.0,
+  "llm_model": null,
+  "llm_temperature": 0.0,
+  "llm_api_key": null,
+  "llm_api_base": null,
+  "resume_from": null,
+  "random_seed": 42
+}

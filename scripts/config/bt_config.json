@@ -1,0 +1,19 @@
+{
+  "preference_eval_file": "results/evaluation/preference_eval_XXX.json",
+  "evaluation_summary_file": "results/evaluation/evaluation_summary_XXX.json",
+  "output_dir": "results/evaluation",
+
+  "system": "Human",
+  "categories": null,
+
+  "components": ["outline", "content", "reference"],
+  "feature_level": "aspect",
+  "fitting_mode": "both",
+
+  "drop_missing_scores": true,
+  "regularization_alpha": 0.1,
+  "normalize_weights": true,
+  "max_iter": 1000,
+  "random_seed": 42,
+  "augment_with_criteria": true
+}

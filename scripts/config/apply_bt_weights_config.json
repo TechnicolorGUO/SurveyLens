@@ -1,0 +1,15 @@
+{
+  "bt_weights_file": "results/evaluation/bt_weights_xxx.json",
+
+  "evaluation_summary_files": [
+    "results/evaluation/evaluation_summary_merged_xxx.json"
+  ],
+
+  "output_dir": "results/evaluation",
+
+  "systems": null,
+  "categories": null,
+  "feature_groups": ["outline", "content", "reference"],
+  "weight_level": "aspect",
+  "compute_aspect_from_criterion": true
+}
