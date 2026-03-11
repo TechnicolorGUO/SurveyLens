@@ -4,7 +4,7 @@
 
 ## Overview
 
-The exponential growth of scientific literature has driven the evolution of Automatic Survey Generation (ASG) from simple pipelines to multi-agent frameworks and commercial Deep Research agents. However, current ASG evaluation methods rely on generic metrics and are heavily biased toward Computer Science (CS), failing to assess whether ASG methods adhere to the distinct standards of various academic disciplines. Consequently, researchers — especially those outside CS — lack clear guidance on using ASG systems to yield high-quality surveys compliant with specific discipline standards.
+The exponential growth of scientific literature has driven the evolution of Automatic Survey Generation (ASG) from simple pipelines to multi-agent frameworks and commercial Deep Research agents. However, current ASG evaluation methods rely on generic metrics and are heavily biased toward Computer Science (CS), failing to assess whether ASG methods adhere to the distinct standards of various academic disciplines. Consequently, researchers, especially those outside CS, lack clear guidance on using ASG systems to yield high-quality surveys compliant with specific discipline standards.
 
 **SurveyLens** is the first discipline-aware benchmark for evaluating ASG methods across diverse research disciplines. We construct **SurveyLens-1k**, a curated dataset of 1,000 high-quality human-written surveys spanning 10 disciplines, and propose a dual-lens evaluation framework:
 
@@ -15,20 +15,11 @@ We conduct extensive experiments evaluating 11 state-of-the-art ASG methods on S
 
 ## Dataset
 
-**SurveyLens-1k** contains 1,000 curated, high-quality human-written survey papers spanning 10 academic disciplines:
+**SurveyLens-1k** contains 1,000 curated, high-quality human-written survey papers spanning 10 academic disciplines (100 surveys each):
 
-| Discipline | Surveys |
-|---|---|
-| Biology | 100 |
-| Business | 100 |
-| Computer Science | 100 |
-| Education | 100 |
-| Engineering | 100 |
-| Environmental Science | 100 |
-| Medicine | 100 |
-| Physics | 100 |
-| Psychology | 100 |
-| Sociology | 100 |
+| Biology | Business | Computer Science | Education | Engineering | Env. Science | Medicine | Physics | Psychology | Sociology |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
 
 **Download:** The full dataset is available on [Google Drive](https://drive.google.com/file/d/1Fr9j_IvQ1BoOM2BEEqnkSgPbKdSV9xFJ/view?usp=sharing).
 
