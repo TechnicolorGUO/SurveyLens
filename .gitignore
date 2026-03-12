@@ -1,7 +1,4 @@
-.env
-outputs
-scripts/__pycache__
-results/evaluation
-*.log
-*.drawio
-test_scripts/
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
