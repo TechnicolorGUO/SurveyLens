@@ -13,6 +13,9 @@ The exponential growth of scientific literature has driven the evolution of Auto
 
 We conduct extensive experiments evaluating 11 state-of-the-art ASG methods on SurveyLens, including Vanilla LLMs, ASG systems, and Deep Research agents. Our analysis reveals the distinct strengths and weaknesses of each paradigm across fields, providing essential guidance for selecting tools tailored to specific disciplinary requirements.
 
+![SurveyLens Overview](assets/overview.png)
+*Figure 1: The SurveyLens dual-lens evaluation framework. Our approach combines (1) Discipline-Aware Rubric Evaluation with human preference-aligned weighting, and (2) Canonical Alignment Evaluation via embedding-based similarity metrics.*
+
 ## Dataset
 
 **SurveyLens-1k** contains 1,000 curated, high-quality human-written survey papers spanning 10 academic disciplines (100 surveys each):
@@ -261,6 +264,9 @@ SurveyLens evaluates the following ASG methods:
 | SciSage | ASG System |
 | SurveyForge | ASG System |
 | SurveyX | ASG System |
+
+![ASG Systems Comparison](assets/radar_of_systems.png)
+*Figure 2: Radar chart comparing ASG methods across key dimensions. The visualization reveals distinct strengths and weaknesses of each paradigm—Vanilla LLMs, specialized ASG systems, and commercial Deep Research agents—across different evaluation criteria.*
 
 ## License
 
