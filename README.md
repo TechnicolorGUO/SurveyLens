@@ -295,6 +295,19 @@ python scripts/evaluation/analyze_results.py <evaluation_summary.json> --output-
 python scripts/evaluation/merge_results.py results/analysis/analysis_1/ results/analysis/analysis_2/ --output-dir results/analysis/merged/
 ```
 
+## Manual Citation Leakage Audit
+
+`Data_Statistics_and_Analysis/flagged_cases_minimal.csv` is a lightweight manual-audit file for verifying potential canonical-survey citation leakage. It contains automatically flagged cases where a generated survey's reference list may cite the original human-written survey for the same topic. `manual_same_paper = 1` means the matched reference was manually judged to be the same paper as the canonical survey; `0` means it was a different paper.
+
+Summary of confirmed leakage:
+
+| System Type | Confirmed Leakage | Rate |
+|---|---|---|
+| Vanilla LLMs | 2 / 200 | 1.00% |
+| ASG Systems | 46 / 665 | 6.92% |
+| Deep Research Agents | 93 / 197 | 47.21% |
+| **Overall** | **141 / 1,062** | **13.29%** |
+
 ## Evaluated Systems
 
 SurveyLens evaluates the following ASG methods:
