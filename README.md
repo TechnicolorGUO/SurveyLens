@@ -328,6 +328,11 @@ SurveyLens evaluates the following ASG methods:
 ![ASG Systems Comparison](assets/radar_of_systems.png)
 *Figure 2: Radar chart comparing ASG methods across key dimensions. The visualization reveals distinct strengths and weaknesses of each paradigm—Vanilla LLMs, specialized ASG systems, and commercial Deep Research agents—across different evaluation criteria.*
 
+### Cross-Discipline Performance Comparison
+
+![Cross-Discipline Comparison](assets/comparison.png)
+*Figure 3: BT-weighted evaluation scores of all ASG methods across 10 disciplines. Each cell represents the weighted composite score for a given system–discipline pair, highlighting how system performance varies substantially across fields.*
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
