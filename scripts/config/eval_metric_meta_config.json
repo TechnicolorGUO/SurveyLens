@@ -1,0 +1,42 @@
+{
+  "quantitative_result_files": [
+    "results/evaluation/quantitative_evaluation_merged_20260208_191323.json"
+  ],
+  "human_annotation_dir": "human_annotation",
+  "output_dir": "results/meta_evaluation",
+
+  "existing_metrics": [
+    "ra_align_f1",
+    "threshold_gated_maxsim",
+    "redundancy_index",
+    "entry_count_ratio"
+  ],
+
+  "enable_rouge_1_baseline": true,
+
+  "chroma_db_dir": "chromadb_meta_selective",
+  "enable_embedding_baselines": true,
+  "embedding_baselines": [
+    "plain_maxsim",
+    "embedding_f1"
+  ],
+  "embedding_source": "chroma_or_api",
+  "embedding_model": "qwen/qwen3-embedding-8b",
+  "embedding_api_base": "https://openrouter.ai/api/v1",
+  "embedding_api_key_env": "OPENROUTER_API_KEY",
+  "embedding_batch_size": 32,
+  "embedding_max_batch_chars": 200000,
+  "persist_missing_embeddings": true,
+
+  "min_topic_match_ratio": 0.55,
+  "metric_tie_epsilon": 1e-12,
+  "exclude_human_ties": true,
+
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 42,
+  "bootstrap_cluster": "annotator",
+
+  "elo_initial": 1500.0,
+  "elo_k_factor": 32.0,
+  "elo_shuffle_seed": 42
+}
