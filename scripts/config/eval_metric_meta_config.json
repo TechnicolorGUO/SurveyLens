@@ -24,7 +24,7 @@
   "embedding_model": "text-embedding-v3",
   "embedding_api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "embedding_api_key_env": "OPENROUTER_API_KEY",
-  "embedding_batch_size": 32,
+  "embedding_batch_size": 8,
   "embedding_max_batch_chars": 200000,
   "persist_missing_embeddings": true,
 
