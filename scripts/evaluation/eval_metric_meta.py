@@ -62,6 +62,15 @@ class MetaEvalConfig:
     embedding_max_batch_chars: int = 200000
     persist_missing_embeddings: bool = True
 
+    # Same-backbone recomputation of the proposed metrics. These must be
+    # computed from the same similarity matrix as the embedding baselines.
+    outline_threshold: float = 0.7
+    content_threshold: float = 0.7
+    reference_threshold: float = 0.8
+    outline_lambda: float = 1.0
+    content_lambda: float = 1.0
+    reference_lambda: float = 1.0
+
     # Pair/file matching and statistical settings.
     min_topic_match_ratio: float = 0.55
     metric_tie_epsilon: float = 1e-12
@@ -79,7 +88,12 @@ class MetaEvalConfig:
         if self.existing_metrics is None:
             self.existing_metrics = ["ra_align_f1", "threshold_gated_maxsim"]
         if self.embedding_baselines is None:
-            self.embedding_baselines = ["plain_maxsim", "embedding_f1"]
+            self.embedding_baselines = [
+                "plain_maxsim",
+                "embedding_f1",
+                "same_backbone_threshold_gated_maxsim",
+                "same_backbone_ra_align_f1",
+            ]
 
     @classmethod
     def from_json(cls, path: str) -> "MetaEvalConfig":
@@ -330,6 +344,116 @@ class ChromaBaselines:
             matrix.append(row)
         return matrix
 
+    def _threshold(self, component: str) -> float:
+        return float(getattr(self.config, f"{component}_threshold"))
+
+    def _lambda(self, component: str) -> float:
+        return float(getattr(self.config, f"{component}_lambda"))
+
+    @classmethod
+    def _redundancy_weights(
+        cls, generated: Sequence[Sequence[float]], lambda_value: float
+    ) -> List[float]:
+        """Match eval_quantitative.py's generated-side redundancy weights."""
+        if len(generated) <= 1:
+            return [1.0 for _ in generated]
+        matrix = cls._cosine_matrix(generated, generated)
+        weights: List[float] = []
+        for row_index, row in enumerate(matrix):
+            nearest_other = max(
+                (similarity for col_index, similarity in enumerate(row) if col_index != row_index),
+                default=0.0,
+            )
+            weights.append(math.exp(-lambda_value * nearest_other))
+        return weights
+
+    @staticmethod
+    def _hungarian_pairs(weight_matrix: List[List[float]]) -> List[Tuple[int, int]]:
+        """Maximum-weight one-to-one matching, including zero-weight pairs."""
+        try:
+            from scipy.optimize import linear_sum_assignment
+        except ImportError as exc:
+            raise RuntimeError(
+                "scipy is required to recompute same_backbone_ra_align_f1"
+            ) from exc
+        if not weight_matrix or not weight_matrix[0]:
+            return []
+        rows, cols = len(weight_matrix), len(weight_matrix[0])
+        size = max(rows, cols)
+        max_weight = max(max(row) for row in weight_matrix)
+        padded_cost = [
+            [
+                max_weight - weight_matrix[row][col]
+                if row < rows and col < cols
+                else max_weight
+                for col in range(size)
+            ]
+            for row in range(size)
+        ]
+        row_indices, col_indices = linear_sum_assignment(padded_cost)
+        return [
+            (int(row), int(col))
+            for row, col in zip(row_indices, col_indices)
+            if row < rows and col < cols
+        ]
+
+    def _scores_from_embeddings(
+        self,
+        generated: List[List[float]],
+        human: List[List[float]],
+        component: str,
+    ) -> Dict[str, float]:
+        """Compute vanilla and proposed metrics from one shared cosine matrix."""
+        matrix = self._cosine_matrix(generated, human)
+        generated_max = [max(row) if row else 0.0 for row in matrix]
+        human_max = [max(row[col] for row in matrix) for col in range(len(human))]
+
+        precision = statistics.fmean(generated_max)
+        recall = statistics.fmean(human_max)
+        embedding_f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+
+        threshold = self._threshold(component)
+        gated_maxsim = statistics.fmean(
+            similarity if similarity >= threshold else 0.0
+            for similarity in generated_max
+        )
+
+        # This reproduces _compute_bms_redundancy in eval_quantitative.py:
+        # Hungarian assignment is optimized by max(0, sim - threshold), while
+        # only matched pairs meeting the threshold contribute to P/R.
+        matching_weights = [
+            [max(0.0, similarity - threshold) for similarity in row]
+            for row in matrix
+        ]
+        matches = self._hungarian_pairs(matching_weights)
+        redundancy_weights = self._redundancy_weights(
+            generated, self._lambda(component)
+        )
+        precision_sum = 0.0
+        recall_sum = 0.0
+        for generated_index, human_index in matches:
+            if matrix[generated_index][human_index] >= threshold:
+                precision_sum += redundancy_weights[generated_index]
+                recall_sum += 1.0
+        ra_precision = precision_sum / len(generated)
+        ra_recall = recall_sum / len(human)
+        ra_f1 = (
+            2 * ra_precision * ra_recall / (ra_precision + ra_recall)
+            if ra_precision + ra_recall
+            else 0.0
+        )
+
+        return {
+            "plain_maxsim": precision,
+            "embedding_f1": embedding_f1,
+            "same_backbone_threshold_gated_maxsim": gated_maxsim,
+            "same_backbone_ra_align_f1": ra_f1,
+        }
+
     @staticmethod
     def _path_variants(path: str) -> List[str]:
         raw = path.replace("\\", "/")
@@ -428,7 +552,15 @@ class ChromaBaselines:
     ) -> List[List[float]]:
         collection = self._collection(collection_name)
         for candidate in self._path_variants(file_path):
-            result = collection.get(where={"file": candidate}, include=["embeddings"])
+            where: Dict[str, Any] = {"file": candidate}
+            if self.config.embedding_model:
+                where = {
+                    "$and": [
+                        {"file": candidate},
+                        {"embedding_model": str(self.config.embedding_model)},
+                    ]
+                }
+            result = collection.get(where=where, include=["embeddings"])
             embeddings = result.get("embeddings", [])
             if embeddings is not None and len(embeddings) > 0:
                 return [list(map(float, row)) for row in embeddings]
@@ -465,19 +597,13 @@ class ChromaBaselines:
         )
         human_file = (entry.get("alignment") or {}).get("human_file")
         if not human_file:
-            return {"plain_maxsim": None, "embedding_f1": None}
+            return {metric: None for metric in self.config.embedding_baselines}
         human = self._embeddings(
             self._collection_name(category, component, "Human"), human_file, component
         )
         if not generated or not human:
-            return {"plain_maxsim": None, "embedding_f1": None}
-        matrix = self._cosine_matrix(generated, human)
-        precision_values = [max(row) if row else 0.0 for row in matrix]
-        recall_values = [max(row[j] for row in matrix) for j in range(len(human))]
-        precision = statistics.fmean(precision_values)
-        recall = statistics.fmean(recall_values)
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        return {"plain_maxsim": precision, "embedding_f1": f1}
+            return {metric: None for metric in self.config.embedding_baselines}
+        return self._scores_from_embeddings(generated, human, component)
 
 
 def build_pairs(config: MetaEvalConfig) -> Tuple[List[PairRecord], Dict[str, int]]:
