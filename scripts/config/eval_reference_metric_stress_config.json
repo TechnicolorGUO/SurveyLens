@@ -1,0 +1,19 @@
+{
+  "meta_config_path": "scripts/config/eval_metric_meta_config.json",
+  "meta_result_path": "results/meta_evaluation/metric_meta_same_backbone.json",
+  "output_path": "results/meta_evaluation/reference_metric_stress.json",
+
+  "categories": ["Computer Science"],
+  "systems": null,
+
+  "duplication_factors": [2, 4, 8],
+  "distractor_fractions": [0.1, 0.25, 0.5],
+  "distractor_source_surveys": 8,
+  "distractor_pool_multiplier": 4,
+
+  "max_surveys": null,
+  "random_seed": 42,
+
+  "bootstrap_samples": 10000,
+  "confidence_coverages": [0.2, 0.4, 0.6, 0.8, 1.0]
+}
