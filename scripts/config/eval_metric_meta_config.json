@@ -28,6 +28,8 @@
   "embedding_api_key_env": "OPENROUTER_API_KEY",
   "embedding_batch_size": 8,
   "embedding_max_batch_chars": 200000,
+  "embedding_request_timeout": 120,
+  "embedding_max_retries": 5,
   "persist_missing_embeddings": true,
 
   "outline_threshold": 0.7,

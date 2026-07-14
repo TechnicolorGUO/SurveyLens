@@ -60,6 +60,8 @@ class MetaEvalConfig:
     embedding_api_key_env: str = "OPENAI_API_KEY"
     embedding_batch_size: int = 32
     embedding_max_batch_chars: int = 200000
+    embedding_request_timeout: float = 120.0
+    embedding_max_retries: int = 5
     persist_missing_embeddings: bool = True
 
     # Same-backbone recomputation of the proposed metrics. These must be
@@ -325,6 +327,15 @@ class ChromaBaselines:
         self.client = chromadb.PersistentClient(path=path)
         self.config = config
         self._embedding_client: Any = None
+        # The same survey appears in many human pairwise comparisons. Cache
+        # both embeddings and final per-survey scores to avoid repeated Chroma
+        # reads and O(n^2) similarity/Hungarian computations.
+        self._embeddings_cache: Dict[
+            Tuple[str, str, str], List[List[float]]
+        ] = {}
+        self._scores_cache: Dict[
+            Tuple[str, str, str, str, str], Dict[str, Optional[float]]
+        ] = {}
 
     @staticmethod
     def _collection_name(category: str, component: str, system: str) -> str:
@@ -333,6 +344,23 @@ class ChromaBaselines:
 
     @staticmethod
     def _cosine_matrix(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> List[List[float]]:
+        # Reference lists can contain hundreds of entries. NumPy turns what
+        # would otherwise be tens of millions of Python-level operations into
+        # one matrix multiplication. Keep a dependency-free fallback.
+        try:
+            import numpy as np
+
+            left = np.asarray(a, dtype=np.float32)
+            right = np.asarray(b, dtype=np.float32)
+            left_norm = np.linalg.norm(left, axis=1, keepdims=True)
+            right_norm = np.linalg.norm(right, axis=1, keepdims=True)
+            left_norm[left_norm == 0] = 1.0
+            right_norm[right_norm == 0] = 1.0
+            similarities = (left @ right.T) / (left_norm * right_norm.T)
+            return np.maximum(similarities, 0.0).tolist()
+        except ImportError:
+            pass
+
         matrix: List[List[float]] = []
         for left in a:
             norm_l = math.sqrt(sum(x * x for x in left)) or 1.0
@@ -512,7 +540,10 @@ class ChromaBaselines:
                 f"{self.config.embedding_api_key_env}"
             )
         self._embedding_client = OpenAI(
-            api_key=api_key, base_url=self.config.embedding_api_base
+            api_key=api_key,
+            base_url=self.config.embedding_api_base,
+            timeout=self.config.embedding_request_timeout,
+            max_retries=self.config.embedding_max_retries,
         )
         return self._embedding_client
 
@@ -550,6 +581,10 @@ class ChromaBaselines:
     def _embeddings(
         self, collection_name: str, file_path: str, component: str
     ) -> List[List[float]]:
+        cache_key = (collection_name, str(file_path), component)
+        cached = self._embeddings_cache.get(cache_key)
+        if cached is not None:
+            return cached
         collection = self._collection(collection_name)
         for candidate in self._path_variants(file_path):
             where: Dict[str, Any] = {"file": candidate}
@@ -563,11 +598,14 @@ class ChromaBaselines:
             result = collection.get(where=where, include=["embeddings"])
             embeddings = result.get("embeddings", [])
             if embeddings is not None and len(embeddings) > 0:
-                return [list(map(float, row)) for row in embeddings]
+                normalized = [list(map(float, row)) for row in embeddings]
+                self._embeddings_cache[cache_key] = normalized
+                return normalized
         if self.config.embedding_source != "chroma_or_api":
             return []
         texts = self._entry_texts(file_path, component)
         if not texts:
+            self._embeddings_cache[cache_key] = []
             return []
         LOGGER.info("Embedding %d missing %s entries from %s", len(texts), component, file_path)
         embeddings = self._embed_missing(texts)
@@ -587,23 +625,40 @@ class ChromaBaselines:
                     for _ in texts
                 ],
             )
+        self._embeddings_cache[cache_key] = embeddings
         return embeddings
 
     def scores(
         self, entry: Dict[str, Any], system: str, category: str, component: str
     ) -> Dict[str, Optional[float]]:
+        human_file = str((entry.get("alignment") or {}).get("human_file") or "")
+        cache_key = (
+            system,
+            category,
+            component,
+            str(entry.get("file") or ""),
+            human_file,
+        )
+        cached = self._scores_cache.get(cache_key)
+        if cached is not None:
+            return cached
         generated = self._embeddings(
             self._collection_name(category, component, system), entry["file"], component
         )
-        human_file = (entry.get("alignment") or {}).get("human_file")
         if not human_file:
-            return {metric: None for metric in self.config.embedding_baselines}
+            result = {metric: None for metric in self.config.embedding_baselines}
+            self._scores_cache[cache_key] = result
+            return result
         human = self._embeddings(
             self._collection_name(category, component, "Human"), human_file, component
         )
         if not generated or not human:
-            return {metric: None for metric in self.config.embedding_baselines}
-        return self._scores_from_embeddings(generated, human, component)
+            result = {metric: None for metric in self.config.embedding_baselines}
+            self._scores_cache[cache_key] = result
+            return result
+        result = self._scores_from_embeddings(generated, human, component)
+        self._scores_cache[cache_key] = result
+        return result
 
 
 def build_pairs(config: MetaEvalConfig) -> Tuple[List[PairRecord], Dict[str, int]]:
