@@ -16,6 +16,7 @@ import math
 import random
 import re
 import statistics
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -52,6 +53,15 @@ class MetaEvalConfig:
     # Local lexical baseline computed from processed generated/Human JSON files.
     enable_rouge_1_baseline: bool = True
     standard_rouge_metrics: List[str] = None  # type: ignore[assignment]
+
+    # Reference-list baselines from prior ASG evaluation work.  These are
+    # computed locally from references[].title and require neither embeddings
+    # nor API calls.  ``surveygen_style_*`` is explicitly named as a style
+    # reproduction because SurveyGen specifies textual similarity > 0.95 but
+    # does not fully specify the similarity implementation in the paper.
+    enable_citation_set_baselines: bool = True
+    citation_set_metrics: List[str] = None  # type: ignore[assignment]
+    surveygen_title_similarity_threshold: float = 0.95
 
     # Optional persisted embeddings. No API calls are made by this script.
     chroma_db_dir: Optional[str] = None
@@ -107,6 +117,20 @@ class MetaEvalConfig:
                 "rougeL_f1",
                 "rougeLsum_f1",
             ]
+        if self.citation_set_metrics is None:
+            self.citation_set_metrics = [
+                "citation_normalized_exact_precision",
+                "citation_normalized_exact_recall",
+                "citation_normalized_exact_f1",
+                "surveyforge_sam_r",
+                "surveygen_style_precision",
+                "surveygen_style_recall",
+                "surveygen_style_f1",
+            ]
+        if not 0.0 <= self.surveygen_title_similarity_threshold <= 1.0:
+            raise ValueError(
+                "surveygen_title_similarity_threshold must be between 0 and 1"
+            )
         if self.embedding_baselines is None:
             self.embedding_baselines = [
                 "plain_maxsim",
@@ -380,6 +404,165 @@ def _standard_rouge_scores(
     return _standard_rouge_scores_for_paths(
         generated_file, human_file, component
     )
+
+
+def _normalize_reference_title(value: str) -> str:
+    """Normalize a title for set identity and fuzzy string matching.
+
+    NFKC handles presentation variants without translating or stemming the
+    title.  Keeping Unicode word characters avoids silently deleting titles in
+    non-Latin scripts.  The processed files normally provide a dedicated title,
+    so bibliography numbering and URLs from the raw ``text`` field are not
+    intentionally folded into the identity.
+    """
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
+
+
+@lru_cache(maxsize=None)
+def _reference_titles(path: str) -> Tuple[str, ...]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return ()
+
+    titles: List[str] = []
+    for item in payload.get("references", []):
+        if isinstance(item, dict):
+            # Prefer the extracted title. Falling back to the full bibliography
+            # string keeps older processed files usable, but is less exact.
+            value = str(item.get("title") or item.get("text") or "")
+        elif isinstance(item, str):
+            value = item
+        else:
+            continue
+        normalized = _normalize_reference_title(value)
+        if normalized:
+            titles.append(normalized)
+    # The cited papers are sets in SciSage/SurveyForge/SurveyEval definitions.
+    # Preserve deterministic order while removing duplicate bibliography rows.
+    return tuple(dict.fromkeys(titles))
+
+
+def _maximum_bipartite_matches(edges: Sequence[Sequence[int]], right_size: int) -> int:
+    """Return maximum one-to-one matches for a thresholded bipartite graph."""
+    matched_left_for_right = [-1] * right_size
+
+    def augment(left: int, seen: List[bool]) -> bool:
+        for right in edges[left]:
+            if seen[right]:
+                continue
+            seen[right] = True
+            previous_left = matched_left_for_right[right]
+            if previous_left == -1 or augment(previous_left, seen):
+                matched_left_for_right[right] = left
+                return True
+        return False
+
+    matches = 0
+    for left in range(len(edges)):
+        if augment(left, [False] * right_size):
+            matches += 1
+    return matches
+
+
+def _fuzzy_title_true_positives(
+    generated: Sequence[str], human: Sequence[str], threshold: float
+) -> int:
+    """Count one-to-one title matches using normalized edit similarity."""
+    edges: List[List[int]] = []
+    for generated_title in generated:
+        candidates: List[Tuple[float, int]] = []
+        for human_index, human_title in enumerate(human):
+            # SequenceMatcher's theoretical ratio cannot exceed this length
+            # bound, which cheaply skips obviously incompatible titles.
+            upper_bound = 2.0 * min(len(generated_title), len(human_title)) / (
+                len(generated_title) + len(human_title)
+            )
+            if upper_bound < threshold:
+                continue
+            similarity = SequenceMatcher(
+                None, generated_title, human_title, autojunk=False
+            ).ratio()
+            if similarity > threshold:
+                candidates.append((similarity, human_index))
+        # Trying the strongest edges first makes the deterministic matching
+        # intuitive; augmenting paths still guarantee maximum cardinality.
+        edges.append(
+            [index for _, index in sorted(candidates, key=lambda x: (-x[0], x[1]))]
+        )
+    return _maximum_bipartite_matches(edges, len(human))
+
+
+def _precision_recall_f1(
+    true_positives: int, generated_count: int, human_count: int
+) -> Tuple[float, float, float]:
+    precision = true_positives / generated_count if generated_count else 0.0
+    recall = true_positives / human_count if human_count else 0.0
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+    return precision, recall, f1
+
+
+def _citation_set_scores(
+    generated: Sequence[str], human: Sequence[str], fuzzy_threshold: float
+) -> Dict[str, float]:
+    """Compute SciSage/SurveyEval, SurveyForge, and SurveyGen-style metrics."""
+    generated_titles = tuple(dict.fromkeys(generated))
+    human_titles = tuple(dict.fromkeys(human))
+
+    exact_tp = len(set(generated_titles).intersection(human_titles))
+    exact_precision, exact_recall, exact_f1 = _precision_recall_f1(
+        exact_tp, len(generated_titles), len(human_titles)
+    )
+    fuzzy_tp = _fuzzy_title_true_positives(
+        generated_titles, human_titles, fuzzy_threshold
+    )
+    fuzzy_precision, fuzzy_recall, fuzzy_f1 = _precision_recall_f1(
+        fuzzy_tp, len(generated_titles), len(human_titles)
+    )
+    return {
+        "citation_normalized_exact_precision": exact_precision,
+        "citation_normalized_exact_recall": exact_recall,
+        "citation_normalized_exact_f1": exact_f1,
+        # SurveyForge Eq. (4) is |R_generated intersect R_human| / |R_generated|.
+        "surveyforge_sam_r": exact_precision,
+        "surveygen_style_precision": fuzzy_precision,
+        "surveygen_style_recall": fuzzy_recall,
+        "surveygen_style_f1": fuzzy_f1,
+    }
+
+
+@lru_cache(maxsize=None)
+def _citation_set_scores_for_paths(
+    generated_path: str, human_path: str, fuzzy_threshold: float
+) -> Dict[str, float]:
+    return _citation_set_scores(
+        _reference_titles(generated_path),
+        _reference_titles(human_path),
+        fuzzy_threshold,
+    )
+
+
+def _citation_baseline_scores(
+    entry: Dict[str, Any], component: str, config: MetaEvalConfig
+) -> Dict[str, Optional[float]]:
+    if component != "reference":
+        return {metric: None for metric in config.citation_set_metrics}
+    generated_file = str(entry.get("file") or "")
+    human_file = str((entry.get("alignment") or {}).get("human_file") or "")
+    if not generated_file or not human_file:
+        return {metric: None for metric in config.citation_set_metrics}
+    scores = _citation_set_scores_for_paths(
+        generated_file,
+        human_file,
+        config.surveygen_title_similarity_threshold,
+    )
+    return {metric: scores.get(metric) for metric in config.citation_set_metrics}
 
 
 class ChromaBaselines:
@@ -827,6 +1010,14 @@ def build_pairs(config: MetaEvalConfig) -> Tuple[List[PairRecord], Dict[str, int
                     "a": standard_rouge_a.get(metric),
                     "b": standard_rouge_b.get(metric),
                 }
+        if config.enable_citation_set_baselines:
+            citation_a = _citation_baseline_scores(entry_a, component, config)
+            citation_b = _citation_baseline_scores(entry_b, component, config)
+            for metric in config.citation_set_metrics:
+                score_map[metric] = {
+                    "a": citation_a.get(metric),
+                    "b": citation_b.get(metric),
+                }
         if chroma:
             try:
                 baseline_a = chroma.scores(entry_a, system_a, category, component)
@@ -1019,6 +1210,10 @@ def evaluate(config: MetaEvalConfig) -> Dict[str, Any]:
         metrics.append("rouge_1")
         metrics.extend(
             metric for metric in config.standard_rouge_metrics if metric not in metrics
+        )
+    if config.enable_citation_set_baselines:
+        metrics.extend(
+            metric for metric in config.citation_set_metrics if metric not in metrics
         )
     if config.enable_embedding_baselines:
         metrics.extend(metric for metric in config.embedding_baselines if metric not in metrics)

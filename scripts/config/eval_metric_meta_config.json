@@ -21,6 +21,18 @@
     "rougeLsum_f1"
   ],
 
+  "enable_citation_set_baselines": true,
+  "citation_set_metrics": [
+    "citation_normalized_exact_precision",
+    "citation_normalized_exact_recall",
+    "citation_normalized_exact_f1",
+    "surveyforge_sam_r",
+    "surveygen_style_precision",
+    "surveygen_style_recall",
+    "surveygen_style_f1"
+  ],
+  "surveygen_title_similarity_threshold": 0.95,
+
   "chroma_db_dir": "chromadb_meta_selective",
   "enable_embedding_baselines": true,
   "embedding_baselines": [
