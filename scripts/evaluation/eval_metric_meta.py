@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -43,12 +44,14 @@ class MetaEvalConfig:
     quantitative_result_files: List[str]
     human_annotation_dir: str = "human_annotation"
     output_dir: str = "results/meta_evaluation"
+    components: Optional[List[str]] = None
 
     # Existing metrics saved by eval_quantitative.py.
     existing_metrics: List[str] = None  # type: ignore[assignment]
 
     # Local lexical baseline computed from processed generated/Human JSON files.
     enable_rouge_1_baseline: bool = True
+    standard_rouge_metrics: List[str] = None  # type: ignore[assignment]
 
     # Optional persisted embeddings. No API calls are made by this script.
     chroma_db_dir: Optional[str] = None
@@ -60,6 +63,7 @@ class MetaEvalConfig:
     embedding_api_key_env: str = "OPENAI_API_KEY"
     embedding_batch_size: int = 32
     embedding_max_batch_chars: int = 200000
+    embedding_max_input_chars: int = 8000
     embedding_request_timeout: float = 120.0
     embedding_max_retries: int = 5
     persist_missing_embeddings: bool = True
@@ -87,13 +91,28 @@ class MetaEvalConfig:
     elo_shuffle_seed: int = 42
 
     def __post_init__(self) -> None:
+        if self.components is None:
+            self.components = list(COMPONENTS)
+        invalid_components = set(self.components) - set(COMPONENTS)
+        if invalid_components:
+            raise ValueError(
+                f"Unknown components in config: {sorted(invalid_components)}"
+            )
         if self.existing_metrics is None:
             self.existing_metrics = ["ra_align_f1", "threshold_gated_maxsim"]
+        if self.standard_rouge_metrics is None:
+            self.standard_rouge_metrics = [
+                "rouge1_f1",
+                "rouge2_f1",
+                "rougeL_f1",
+                "rougeLsum_f1",
+            ]
         if self.embedding_baselines is None:
             self.embedding_baselines = [
                 "plain_maxsim",
                 "embedding_f1",
                 "same_backbone_threshold_gated_maxsim",
+                "same_backbone_paper_tau_maxsim",
                 "same_backbone_ra_align_f1",
             ]
 
@@ -313,6 +332,56 @@ def _rouge_score(entry: Dict[str, Any], component: str) -> Optional[float]:
     return _rouge_1_f1(generated, human) if generated and human else None
 
 
+@lru_cache(maxsize=None)
+def _standard_rouge_scores_for_paths(
+    generated_path: str, human_path: str, component: str
+) -> Dict[str, Optional[float]]:
+    """Compute standard stemmed ROUGE F1 variants with google/rouge-score."""
+    try:
+        from rouge_score import rouge_scorer
+    except ImportError as exc:
+        raise RuntimeError(
+            "rouge-score is required for standard ROUGE baselines; "
+            "install it with `uv pip install rouge-score`"
+        ) from exc
+
+    generated = _component_text(generated_path, component)
+    human = _component_text(human_path, component)
+    metric_names = {
+        "rouge1_f1": "rouge1",
+        "rouge2_f1": "rouge2",
+        "rougeL_f1": "rougeL",
+        "rougeLsum_f1": "rougeLsum",
+    }
+    if not generated or not human:
+        return {metric: None for metric in metric_names}
+    scorer = rouge_scorer.RougeScorer(
+        list(metric_names.values()), use_stemmer=True, split_summaries=False
+    )
+    scores = scorer.score(human, generated)
+    return {
+        output_name: float(scores[rouge_name].fmeasure)
+        for output_name, rouge_name in metric_names.items()
+    }
+
+
+def _standard_rouge_scores(
+    entry: Dict[str, Any], component: str
+) -> Dict[str, Optional[float]]:
+    human_file = str((entry.get("alignment") or {}).get("human_file") or "")
+    generated_file = str(entry.get("file") or "")
+    if not generated_file or not human_file:
+        return {
+            "rouge1_f1": None,
+            "rouge2_f1": None,
+            "rougeL_f1": None,
+            "rougeLsum_f1": None,
+        }
+    return _standard_rouge_scores_for_paths(
+        generated_file, human_file, component
+    )
+
+
 class ChromaBaselines:
     """Read-only embedding baselines over existing ChromaDB collections."""
 
@@ -449,6 +518,7 @@ class ChromaBaselines:
             similarity if similarity >= threshold else 0.0
             for similarity in generated_max
         )
+        paper_tau_maxsim = self._paper_tau_maxsim(generated_max, threshold)
 
         # This reproduces _compute_bms_redundancy in eval_quantitative.py:
         # Hungarian assignment is optimized by max(0, sim - threshold), while
@@ -479,8 +549,27 @@ class ChromaBaselines:
             "plain_maxsim": precision,
             "embedding_f1": embedding_f1,
             "same_backbone_threshold_gated_maxsim": gated_maxsim,
+            "same_backbone_paper_tau_maxsim": paper_tau_maxsim,
             "same_backbone_ra_align_f1": ra_f1,
         }
+
+    @staticmethod
+    def _paper_tau_maxsim(
+        generated_max_similarities: Sequence[float], threshold: float
+    ) -> float:
+        """Compute the margin-based tau-MaxSim stated in paper Eq. (8).
+
+        For each generated entry e, Eq. (8) contributes
+        max(0, max_g sim(e, g) - tau_c), then averages over generated
+        entries. This is intentionally kept separate from the implementation's
+        threshold-gated variant, which retains the full similarity above tau.
+        """
+        if not generated_max_similarities:
+            return 0.0
+        return statistics.fmean(
+            max(0.0, similarity - threshold)
+            for similarity in generated_max_similarities
+        )
 
     @staticmethod
     def _path_variants(path: str) -> List[str]:
@@ -550,6 +639,17 @@ class ChromaBaselines:
     def _embed_missing(self, texts: List[str]) -> List[List[float]]:
         client = self._client_for_api()
         embeddings: List[List[float]] = []
+        max_input_chars = max(1, int(self.config.embedding_max_input_chars))
+        truncated_count = sum(len(text) > max_input_chars for text in texts)
+        if truncated_count:
+            LOGGER.warning(
+                "Truncating %d/%d embedding inputs to %d characters to stay "
+                "within the provider's per-input token limit",
+                truncated_count,
+                len(texts),
+                max_input_chars,
+            )
+        texts = [text[:max_input_chars] for text in texts]
         size = max(1, self.config.embedding_batch_size)
         batches: List[List[str]] = []
         batch: List[str] = []
@@ -666,7 +766,13 @@ def build_pairs(config: MetaEvalConfig) -> Tuple[List[PairRecord], Dict[str, int
     systems = _system_lookup(results)
     all_categories = {category for categories in results.values() for category in categories}
     categories = _category_lookup(all_categories)
-    annotations = load_annotations(config.human_annotation_dir)
+    all_annotations = load_annotations(config.human_annotation_dir)
+    selected_components = set(config.components or COMPONENTS)
+    annotations = [
+        item
+        for item in all_annotations
+        if str(item.get("dataset_type") or "").lower() in selected_components
+    ]
 
     chroma: Optional[ChromaBaselines] = None
     if config.enable_embedding_baselines:
@@ -714,6 +820,13 @@ def build_pairs(config: MetaEvalConfig) -> Tuple[List[PairRecord], Dict[str, int
                 "a": _rouge_score(entry_a, component),
                 "b": _rouge_score(entry_b, component),
             }
+            standard_rouge_a = _standard_rouge_scores(entry_a, component)
+            standard_rouge_b = _standard_rouge_scores(entry_b, component)
+            for metric in config.standard_rouge_metrics:
+                score_map[metric] = {
+                    "a": standard_rouge_a.get(metric),
+                    "b": standard_rouge_b.get(metric),
+                }
         if chroma:
             try:
                 baseline_a = chroma.scores(entry_a, system_a, category, component)
@@ -747,6 +860,7 @@ def build_pairs(config: MetaEvalConfig) -> Tuple[List[PairRecord], Dict[str, int
         )
         diagnostics["matched"] += 1
     diagnostics["annotations_total"] = len(annotations)
+    diagnostics["annotations_total_all_components"] = len(all_annotations)
     return pairs, dict(diagnostics)
 
 
@@ -903,6 +1017,9 @@ def evaluate(config: MetaEvalConfig) -> Dict[str, Any]:
     metrics = list(config.existing_metrics)
     if config.enable_rouge_1_baseline:
         metrics.append("rouge_1")
+        metrics.extend(
+            metric for metric in config.standard_rouge_metrics if metric not in metrics
+        )
     if config.enable_embedding_baselines:
         metrics.extend(metric for metric in config.embedding_baselines if metric not in metrics)
 

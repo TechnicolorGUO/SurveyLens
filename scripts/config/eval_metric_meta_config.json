@@ -4,6 +4,7 @@
   ],
   "human_annotation_dir": "human_annotation",
   "output_dir": "results/meta_evaluation",
+  "components": ["reference"],
 
   "existing_metrics": [
     "ra_align_f1",
@@ -13,6 +14,12 @@
   ],
 
   "enable_rouge_1_baseline": true,
+  "standard_rouge_metrics": [
+    "rouge1_f1",
+    "rouge2_f1",
+    "rougeL_f1",
+    "rougeLsum_f1"
+  ],
 
   "chroma_db_dir": "chromadb_meta_selective",
   "enable_embedding_baselines": true,
@@ -20,6 +27,7 @@
     "plain_maxsim",
     "embedding_f1",
     "same_backbone_threshold_gated_maxsim",
+    "same_backbone_paper_tau_maxsim",
     "same_backbone_ra_align_f1"
   ],
   "embedding_source": "chroma_or_api",
@@ -28,6 +36,7 @@
   "embedding_api_key_env": "OPENROUTER_API_KEY",
   "embedding_batch_size": 8,
   "embedding_max_batch_chars": 200000,
+  "embedding_max_input_chars": 8000,
   "embedding_request_timeout": 120,
   "embedding_max_retries": 5,
   "persist_missing_embeddings": true,
