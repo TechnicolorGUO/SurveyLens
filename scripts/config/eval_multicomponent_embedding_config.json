@@ -1,0 +1,21 @@
+{
+  "v2_config_file": "scripts/config/eval_multicomponent_alignment_proxy_config.json",
+  "chroma_db_dir": "chromadb_meta_selective",
+  "components": ["outline", "content", "reference"],
+  "embedding_model": "text-embedding-v3",
+  "embedding_api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "embedding_api_key_env": "OPENROUTER_API_KEY",
+  "env_file": ".env",
+  "embedding_batch_size": 8,
+  "embedding_max_batch_chars": 200000,
+  "embedding_max_input_chars": 8000,
+  "embedding_request_timeout": 120,
+  "embedding_max_retries": 5,
+  "persist_missing_embeddings": true,
+  "outline_threshold": 0.7,
+  "content_threshold": 0.7,
+  "reference_threshold": 0.8,
+  "outline_lambda": 1.0,
+  "content_lambda": 1.0,
+  "reference_lambda": 1.0
+}

@@ -1,0 +1,33 @@
+{
+  "quantitative_result_file": "results/evaluation/quantitative_evaluation_merged_20260208_191323.json",
+  "topic_matches_file": "results/topic_matches.json",
+  "output_dir": "results/multicomponent_alignment_proxy",
+  "sample_size": 75,
+  "random_seed": 9057,
+  "categories": null,
+  "max_pairs_per_topic": 2,
+  "max_entries": {
+    "outline": 200,
+    "content": 320,
+    "reference": 250
+  },
+  "max_combined_chars": {
+    "outline": 50000,
+    "content": 180000,
+    "reference": 100000
+  },
+  "metric_tie_epsilon": 1e-12,
+  "bootstrap_samples": 5000,
+  "bootstrap_seed": 42,
+  "aggregate_rating_epsilon": 1e-12,
+  "surveygen_title_similarity_threshold": 0.95,
+  "model": "gpt-5.6-luna",
+  "endpoint": "responses",
+  "api_key_env": "OHMYGPT_API_KEY",
+  "api_base_env": "OHMYGPT_BASE_URL",
+  "temperature": 0.0,
+  "max_retries": 4,
+  "request_timeout": 180.0,
+  "order_repetitions": 2,
+  "env_file": ".env"
+}
