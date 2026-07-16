@@ -1,5 +1,6 @@
 {
   "v2_config_file": "scripts/config/eval_multicomponent_alignment_proxy_config.json",
+  "components": ["outline", "content", "reference"],
   "bertscore_model_type": "roberta-large",
   "bertscore_lang": "en",
   "bertscore_num_layers": null,
@@ -8,6 +9,8 @@
   "bertscore_rescale_with_baseline": false,
   "bertscore_use_fast_tokenizer": false,
   "chunk_max_words": 200,
+  "bertscore_full_matrix_max_pairs": 512,
+  "bertscore_chunk_top_k": 5,
   "checkpoint_every_sides": 5,
   "force_recompute": false,
   "rouge_metric_name": "entry_aware_rouge2_f1",

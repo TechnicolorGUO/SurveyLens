@@ -1,10 +1,11 @@
-"""Add reference-list ROUGE-2 and BERTScore baselines to frozen V2 pairs.
+"""Add entry-aware ROUGE-2 and chunked BERTScore to frozen V2 pairs.
 
-ROUGE-2 is computed within reference-entry boundaries, so no artificial bigram
-is created between adjacent bibliography entries.  Reference lists can exceed
-the sequence limit of standard document-level BERTScore, so BERTScore is
-computed over entry-preserving chunks.  Candidate-side precision and
-human-reference-side recall are max-matched across chunks and combined as F1.
+ROUGE-2 is computed within entry boundaries, so no artificial bigram is created
+between adjacent headings, sections, or bibliography entries.  Long components
+can exceed the sequence limit of standard document-level BERTScore, so
+BERTScore is computed over entry-preserving chunks.  Candidate-side precision
+and human-reference-side recall are max-matched across chunks and combined as
+F1.
 
 The script incrementally merges metrics into the existing V2 ``pairs.jsonl``.
 It never changes the frozen pair selection or the LLM/human labels.
@@ -26,6 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from tqdm import tqdm
 
 from eval_multicomponent_alignment_proxy import (
+    COMPONENTS,
     Config as V2Config,
     Pair,
     _file_sha256,
@@ -42,6 +44,7 @@ TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
 @dataclass
 class Config:
     v2_config_file: str
+    components: Optional[List[str]] = None
     bertscore_model_type: str = "roberta-large"
     bertscore_lang: str = "en"
     bertscore_num_layers: Optional[int] = None
@@ -50,16 +53,27 @@ class Config:
     bertscore_rescale_with_baseline: bool = False
     bertscore_use_fast_tokenizer: bool = False
     chunk_max_words: int = 200
+    bertscore_full_matrix_max_pairs: int = 512
+    bertscore_chunk_top_k: int = 5
     checkpoint_every_sides: int = 5
     force_recompute: bool = False
     rouge_metric_name: str = "entry_aware_rouge2_f1"
     bertscore_metric_name: str = "chunked_bertscore_f1"
 
     def __post_init__(self) -> None:
+        if self.components is None:
+            self.components = ["reference"]
+        invalid = set(self.components) - set(COMPONENTS)
+        if invalid:
+            raise ValueError(f"Unknown components: {sorted(invalid)}")
         if self.bertscore_batch_size <= 0:
             raise ValueError("bertscore_batch_size must be positive")
         if self.chunk_max_words <= 0:
             raise ValueError("chunk_max_words must be positive")
+        if self.bertscore_full_matrix_max_pairs <= 0:
+            raise ValueError("bertscore_full_matrix_max_pairs must be positive")
+        if self.bertscore_chunk_top_k <= 0:
+            raise ValueError("bertscore_chunk_top_k must be positive")
         if self.checkpoint_every_sides <= 0:
             raise ValueError("checkpoint_every_sides must be positive")
         if not self.rouge_metric_name or not self.bertscore_metric_name:
@@ -169,6 +183,69 @@ def aggregate_chunk_bertscore(
     return 2.0 * p * r / (p + r) if p + r else 0.0
 
 
+def _chunk_pair_indices(
+    candidate_chunks: Sequence[Tuple[str, int]],
+    reference_chunks: Sequence[Tuple[str, int]],
+    full_matrix_max_pairs: int,
+    top_k: int,
+) -> Tuple[List[Tuple[int, int]], str]:
+    candidate_count, reference_count = len(candidate_chunks), len(reference_chunks)
+    if candidate_count * reference_count <= full_matrix_max_pairs:
+        return (
+            [(i, j) for i in range(candidate_count) for j in range(reference_count)],
+            "full_matrix",
+        )
+
+    candidate_tokens = [set(_tokens(text)) for text, _ in candidate_chunks]
+    reference_tokens = [set(_tokens(text)) for text, _ in reference_chunks]
+
+    def similarity(i: int, j: int) -> float:
+        union = candidate_tokens[i] | reference_tokens[j]
+        return (
+            len(candidate_tokens[i] & reference_tokens[j]) / len(union)
+            if union
+            else 0.0
+        )
+
+    selected = set()
+    for i in range(candidate_count):
+        ranked = sorted(
+            range(reference_count),
+            key=lambda j: (-similarity(i, j), j),
+        )[: min(top_k, reference_count)]
+        selected.update((i, j) for j in ranked)
+    for j in range(reference_count):
+        ranked = sorted(
+            range(candidate_count),
+            key=lambda i: (-similarity(i, j), i),
+        )[: min(top_k, candidate_count)]
+        selected.update((i, j) for i in ranked)
+    return sorted(selected), "bidirectional_lexical_top_k"
+
+
+def aggregate_sparse_chunk_bertscore(
+    pair_indices: Sequence[Tuple[int, int]],
+    precision: Sequence[float],
+    recall: Sequence[float],
+    candidate_weights: Sequence[int],
+    reference_weights: Sequence[int],
+) -> float:
+    if not candidate_weights or not reference_weights:
+        return 0.0
+    if len(pair_indices) != len(precision) or len(pair_indices) != len(recall):
+        raise ValueError("Sparse BERTScore values do not match selected chunk pairs")
+    candidate_best = [-math.inf] * len(candidate_weights)
+    reference_best = [-math.inf] * len(reference_weights)
+    for (i, j), p, r in zip(pair_indices, precision, recall):
+        candidate_best[i] = max(candidate_best[i], p)
+        reference_best[j] = max(reference_best[j], r)
+    if any(not math.isfinite(value) for value in candidate_best + reference_best):
+        raise ValueError("Every candidate and reference chunk must be selected")
+    p = sum(value * weight for value, weight in zip(candidate_best, candidate_weights)) / sum(candidate_weights)
+    r = sum(value * weight for value, weight in zip(reference_best, reference_weights)) / sum(reference_weights)
+    return 2.0 * p * r / (p + r) if p + r else 0.0
+
+
 def _verify_hashes(pair: Pair) -> None:
     expected = pair.file_hashes
     actual = {
@@ -222,12 +299,14 @@ def _score_chunk_sets(
             "reference_chunks": len(reference_chunks),
         }
 
-    candidates: List[str] = []
-    references: List[str] = []
-    for candidate_text, _ in candidate_chunks:
-        for reference_text, _ in reference_chunks:
-            candidates.append(candidate_text)
-            references.append(reference_text)
+    pair_indices, pairing_strategy = _chunk_pair_indices(
+        candidate_chunks,
+        reference_chunks,
+        config.bertscore_full_matrix_max_pairs,
+        config.bertscore_chunk_top_k,
+    )
+    candidates = [candidate_chunks[i][0] for i, _ in pair_indices]
+    references = [reference_chunks[j][0] for _, j in pair_indices]
 
     precision, recall, _ = scorer.score(
         candidates,
@@ -237,7 +316,8 @@ def _score_chunk_sets(
     )
     p_values = [float(value) for value in precision.detach().cpu().tolist()]
     r_values = [float(value) for value in recall.detach().cpu().tolist()]
-    score = aggregate_chunk_bertscore(
+    score = aggregate_sparse_chunk_bertscore(
+        pair_indices,
         p_values,
         r_values,
         [weight for _, weight in candidate_chunks],
@@ -248,6 +328,9 @@ def _score_chunk_sets(
     return score, {
         "candidate_chunks": len(candidate_chunks),
         "reference_chunks": len(reference_chunks),
+        "full_chunk_pairs": len(candidate_chunks) * len(reference_chunks),
+        "evaluated_chunk_pairs": len(pair_indices),
+        "pairing_strategy": pairing_strategy,
     }
 
 
@@ -258,60 +341,80 @@ def compute(config: Config, limit_pairs: Optional[int] = None) -> Dict[str, Any]
     output_dir = Path(v2_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    entry_cache: Dict[str, List[str]] = {}
+    entry_cache: Dict[str, Dict[str, List[str]]] = {}
 
-    def references(path: str) -> List[str]:
+    def entries(path: str, component: str) -> List[str]:
         if path not in entry_cache:
-            entry_cache[path] = extract_entries(path)["reference"]
-        return entry_cache[path]
+            entry_cache[path] = extract_entries(path)
+        return entry_cache[path][component]
 
     for pair in tqdm(selected, desc="Entry-aware ROUGE-2", unit="pair", dynamic_ncols=True):
         _verify_hashes(pair)
-        human = references(pair.human_file)
-        metric = pair.metrics["reference"].setdefault(config.rouge_metric_name, {})
-        metric["a"] = entry_aware_rouge_n_f1(references(pair.file_a), human, 2)
-        metric["b"] = entry_aware_rouge_n_f1(references(pair.file_b), human, 2)
+        for component in config.components or []:
+            human = entries(pair.human_file, component)
+            metric = pair.metrics[component].setdefault(config.rouge_metric_name, {})
+            metric["a"] = entry_aware_rouge_n_f1(
+                entries(pair.file_a, component), human, 2
+            )
+            metric["b"] = entry_aware_rouge_n_f1(
+                entries(pair.file_b, component), human, 2
+            )
     _write_jsonl(output_dir / "pairs.jsonl", (asdict(pair) for pair in pairs))
 
     scorer = _build_scorer(config)
     errors: List[Dict[str, str]] = []
     chunk_audit: List[Dict[str, Any]] = []
     completed_sides = 0
-    total_sides = len(selected) * 2
+    total_sides = len(selected) * len(config.components or []) * 2
     progress = tqdm(total=total_sides, desc="Chunked BERTScore", unit="side", dynamic_ncols=True)
     since_checkpoint = 0
     for pair in selected:
-        human = references(pair.human_file)
-        metric = pair.metrics["reference"].setdefault(config.bertscore_metric_name, {})
-        for side, path in (("a", pair.file_a), ("b", pair.file_b)):
-            if not config.force_recompute and isinstance(metric.get(side), (int, float)):
-                completed_sides += 1
+        for component in config.components or []:
+            human = entries(pair.human_file, component)
+            metric = pair.metrics[component].setdefault(config.bertscore_metric_name, {})
+            for side, path in (("a", pair.file_a), ("b", pair.file_b)):
+                if not config.force_recompute and isinstance(metric.get(side), (int, float)):
+                    completed_sides += 1
+                    progress.update(1)
+                    continue
+                try:
+                    score, audit = _score_chunk_sets(
+                        scorer, entries(path, component), human, config
+                    )
+                    metric[side] = score
+                    completed_sides += 1
+                    chunk_audit.append({
+                        "pair_id": pair.pair_id,
+                        "component": component,
+                        "side": side,
+                        **audit,
+                    })
+                except Exception as exc:
+                    errors.append({
+                        "pair_id": pair.pair_id,
+                        "component": component,
+                        "side": side,
+                        "error": str(exc),
+                    })
+                    LOGGER.exception(
+                        "Failed BERTScore for %s/%s/%s",
+                        pair.pair_id,
+                        component,
+                        side,
+                    )
                 progress.update(1)
-                continue
-            try:
-                score, audit = _score_chunk_sets(
-                    scorer, references(path), human, config
-                )
-                metric[side] = score
-                completed_sides += 1
-                chunk_audit.append({"pair_id": pair.pair_id, "side": side, **audit})
-            except Exception as exc:
-                errors.append(
-                    {"pair_id": pair.pair_id, "side": side, "error": str(exc)}
-                )
-                LOGGER.exception("Failed BERTScore for %s/%s", pair.pair_id, side)
-            progress.update(1)
-            since_checkpoint += 1
-            progress.set_postfix(completed=completed_sides, errors=len(errors))
-            if since_checkpoint >= config.checkpoint_every_sides:
-                _write_jsonl(output_dir / "pairs.jsonl", (asdict(item) for item in pairs))
-                since_checkpoint = 0
+                since_checkpoint += 1
+                progress.set_postfix(completed=completed_sides, errors=len(errors))
+                if since_checkpoint >= config.checkpoint_every_sides:
+                    _write_jsonl(output_dir / "pairs.jsonl", (asdict(item) for item in pairs))
+                    since_checkpoint = 0
     progress.close()
     _write_jsonl(output_dir / "pairs.jsonl", (asdict(pair) for pair in pairs))
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "selected_pairs": len(selected),
+        "components": config.components,
         "total_sides": total_sides,
         "completed_sides": completed_sides,
         "errors": errors,
@@ -325,7 +428,7 @@ def compute(config: Config, limit_pairs: Optional[int] = None) -> Dict[str, Any]
         "chunk_audit": chunk_audit,
         "config": asdict(config),
     }
-    status_path = output_dir / "reference_rouge_bertscore_status.json"
+    status_path = output_dir / "multicomponent_rouge_bertscore_status.json"
     status_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )
