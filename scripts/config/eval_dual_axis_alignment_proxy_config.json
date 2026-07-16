@@ -1,0 +1,17 @@
+{
+  "source_pairs_file": "results/multicomponent_alignment_proxy/pairs.jsonl",
+  "output_dir": "results/dual_axis_alignment_proxy",
+  "components": ["reference"],
+  "model": "gpt-5.6-luna",
+  "endpoint": "responses",
+  "api_key_env": "OHMYGPT_API_KEY",
+  "api_base_env": "OHMYGPT_BASE_URL",
+  "temperature": 0.0,
+  "max_retries": 4,
+  "request_timeout": 180.0,
+  "order_repetitions": 2,
+  "env_file": ".env",
+  "metric_tie_epsilon": 1e-12,
+  "bootstrap_samples": 5000,
+  "bootstrap_seed": 42
+}
