@@ -62,6 +62,7 @@ class StressConfig:
     categories: Optional[List[str]] = None
     systems: Optional[List[str]] = None
     duplication_factors: Optional[List[int]] = None
+    collapse_fractions: Optional[List[float]] = None
     distractor_fractions: Optional[List[float]] = None
     distractor_source_surveys: int = 8
     distractor_pool_multiplier: int = 4
@@ -83,12 +84,16 @@ class StressConfig:
     def __post_init__(self) -> None:
         if self.duplication_factors is None:
             self.duplication_factors = [2, 4, 8]
+        if self.collapse_fractions is None:
+            self.collapse_fractions = [0.25, 0.5, 1.0]
         if self.distractor_fractions is None:
             self.distractor_fractions = [0.1, 0.25, 0.5]
         if self.confidence_coverages is None:
             self.confidence_coverages = [0.2, 0.4, 0.6, 0.8, 1.0]
         if any(value < 2 for value in self.duplication_factors):
             raise ValueError("duplication_factors must all be >= 2")
+        if any(not 0.0 < value <= 1.0 for value in self.collapse_fractions):
+            raise ValueError("collapse_fractions must be in (0, 1]")
         if any(not 0.0 < value <= 1.0 for value in self.distractor_fractions):
             raise ValueError("distractor_fractions must be in (0, 1]")
         if any(not 0.0 < value <= 1.0 for value in self.confidence_coverages):
@@ -330,6 +335,43 @@ def _best_generated_index(
     return max(range(len(maxima)), key=maxima.__getitem__)
 
 
+def _many_to_one_collapse(
+    chroma: ChromaBaselines,
+    generated: Sequence[Sequence[float]],
+    generated_entries: Sequence[str],
+    human: Sequence[Sequence[float]],
+    fraction: float,
+) -> Tuple[List[List[float]], List[str], int, int]:
+    """Replace weak entries with copies of one best-aligned generated entry.
+
+    The generated-set cardinality is fixed.  At severity 1.0 every entry is a
+    copy of the same best-aligned entry.  Replacing the weakest entries first
+    creates an adversarial many-to-one collapse without the length increase of
+    the append-only duplication attack.
+    """
+    if len(generated) != len(generated_entries):
+        raise ValueError("generated vectors and entries must have equal lengths")
+    if not generated:
+        return [], [], 0, -1
+    matrix = chroma._cosine_matrix(generated, human)
+    maxima = [max(row) if row else 0.0 for row in matrix]
+    best_index = max(range(len(maxima)), key=maxima.__getitem__)
+    replace_count = min(
+        len(generated) - 1,
+        int(math.ceil(len(generated) * fraction)),
+    )
+    weakest = sorted(
+        (index for index in range(len(generated)) if index != best_index),
+        key=lambda index: (maxima[index], index),
+    )[:replace_count]
+    attacked_vectors = [list(vector) for vector in generated]
+    attacked_entries = list(generated_entries)
+    for index in weakest:
+        attacked_vectors[index] = list(generated[best_index])
+        attacked_entries[index] = generated_entries[best_index]
+    return attacked_vectors, attacked_entries, len(weakest), best_index
+
+
 @lru_cache(maxsize=None)
 def _reference_entries(path: str) -> Tuple[str, ...]:
     return tuple(extract_entries(path)["reference"])
@@ -368,6 +410,7 @@ def _condition_record(
     original_count: int,
     added_count: int,
     metrics: Sequence[str],
+    replaced_count: int = 0,
 ) -> Dict[str, Any]:
     return {
         "system": target.system,
@@ -379,6 +422,7 @@ def _condition_record(
         "severity": severity,
         "original_reference_count": original_count,
         "added_reference_count": added_count,
+        "replaced_reference_count": replaced_count,
         "base_scores": {metric: base_scores[metric] for metric in metrics},
         "attacked_scores": {
             metric: attacked_scores[metric] for metric in metrics
@@ -491,6 +535,41 @@ def run_stress_tests(
                         len(generated),
                         len(added),
                         metrics,
+                    )
+                )
+
+            for fraction in config.collapse_fractions or []:
+                collapsed_vectors, collapsed_entries, replaced_count, _ = (
+                    _many_to_one_collapse(
+                        chroma,
+                        generated,
+                        generated_entries,
+                        human,
+                        float(fraction),
+                    )
+                )
+                collapsed_scores = chroma._scores_from_embeddings(
+                    collapsed_vectors, human, "reference"
+                )
+                collapsed_scores.update(
+                    _text_scores(
+                        collapsed_entries,
+                        human_entries,
+                        config,
+                        bert_scorer,
+                    )
+                )
+                records.append(
+                    _condition_record(
+                        target,
+                        "fixed_length_many_to_one_collapse",
+                        float(fraction),
+                        base_scores,
+                        collapsed_scores,
+                        len(generated),
+                        0,
+                        metrics,
+                        replaced_count=replaced_count,
                     )
                 )
 
@@ -671,6 +750,12 @@ def main() -> None:
             "duplicate_attack": (
                 "Duplicates the generated reference with the highest cosine "
                 "similarity to any human reference."
+            ),
+            "many_to_one_collapse_attack": (
+                "Keeps generated-set cardinality fixed while replacing the "
+                "weakest 25%, 50%, or all replaceable entries with copies of "
+                "one best-aligned generated entry. At severity 1.0 every "
+                "generated entry is identical."
             ),
             "distractor_attack": (
                 "Adds the lowest-similarity cached reference vectors sampled "

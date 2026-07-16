@@ -7,6 +7,7 @@
   "systems": null,
 
   "duplication_factors": [2, 4, 8],
+  "collapse_fractions": [0.25, 0.5, 1.0],
   "distractor_fractions": [0.1, 0.25, 0.5],
   "distractor_source_surveys": 8,
   "distractor_pool_multiplier": 4,
