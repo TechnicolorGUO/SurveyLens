@@ -24,21 +24,34 @@ import statistics
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
 from eval_metric_meta import ChromaBaselines, MetaEvalConfig, _merge_quantitative_results
+from compute_reference_rouge_bertscore import (
+    Config as TextMetricConfig,
+    _build_scorer,
+    _score_chunk_sets,
+    entry_aware_rouge_n_f1,
+)
+from eval_multicomponent_alignment_proxy import extract_entries
 
 
 LOGGER = logging.getLogger("reference_metric_stress")
-STRESS_METRICS = (
+EMBEDDING_STRESS_METRICS = (
     "plain_maxsim",
     "embedding_f1",
     "same_backbone_paper_tau_maxsim",
     "same_backbone_ra_align_f1",
 )
+TEXT_STRESS_METRICS = (
+    "entry_aware_rouge2_f1",
+    "chunked_bertscore_f1",
+)
+STRESS_METRICS = EMBEDDING_STRESS_METRICS + TEXT_STRESS_METRICS
 
 
 @dataclass
@@ -56,6 +69,16 @@ class StressConfig:
     random_seed: int = 42
     bootstrap_samples: int = 10000
     confidence_coverages: Optional[List[float]] = None
+    enable_entry_aware_rouge2: bool = False
+    enable_chunked_bertscore: bool = False
+    bertscore_model_type: str = "roberta-large"
+    bertscore_lang: str = "en"
+    bertscore_num_layers: Optional[int] = None
+    bertscore_batch_size: int = 16
+    bertscore_device: Optional[str] = None
+    bertscore_rescale_with_baseline: bool = False
+    bertscore_use_fast_tokenizer: bool = False
+    chunk_max_words: int = 200
 
     def __post_init__(self) -> None:
         if self.duplication_factors is None:
@@ -70,11 +93,38 @@ class StressConfig:
             raise ValueError("distractor_fractions must be in (0, 1]")
         if any(not 0.0 < value <= 1.0 for value in self.confidence_coverages):
             raise ValueError("confidence_coverages must be in (0, 1]")
+        if self.bertscore_batch_size <= 0:
+            raise ValueError("bertscore_batch_size must be positive")
+        if self.chunk_max_words <= 0:
+            raise ValueError("chunk_max_words must be positive")
 
     @classmethod
     def from_json(cls, path: str) -> "StressConfig":
         with open(path, "r", encoding="utf-8") as handle:
             return cls(**json.load(handle))
+
+    def text_metric_config(self) -> TextMetricConfig:
+        """Expose the shared BERTScore settings without duplicating scoring code."""
+        return TextMetricConfig(
+            v2_config_file="unused-by-stress-test",
+            bertscore_model_type=self.bertscore_model_type,
+            bertscore_lang=self.bertscore_lang,
+            bertscore_num_layers=self.bertscore_num_layers,
+            bertscore_batch_size=self.bertscore_batch_size,
+            bertscore_device=self.bertscore_device,
+            bertscore_rescale_with_baseline=self.bertscore_rescale_with_baseline,
+            bertscore_use_fast_tokenizer=self.bertscore_use_fast_tokenizer,
+            chunk_max_words=self.chunk_max_words,
+        )
+
+
+def _configured_stress_metrics(config: StressConfig) -> Tuple[str, ...]:
+    metrics = list(EMBEDDING_STRESS_METRICS)
+    if config.enable_entry_aware_rouge2:
+        metrics.append("entry_aware_rouge2_f1")
+    if config.enable_chunked_bertscore:
+        metrics.append("chunked_bertscore_f1")
+    return tuple(metrics)
 
 
 @dataclass(frozen=True)
@@ -182,10 +232,13 @@ def accuracy_coverage_report(
         pair
         for pair in pairs
         if pair.get("human_choice") != "tie"
-        and all(_pair_credit(pair, metric) is not None for metric in STRESS_METRICS)
+        and all(
+            _pair_credit(pair, metric) is not None
+            for metric in EMBEDDING_STRESS_METRICS
+        )
     ]
     metrics: Dict[str, Any] = {}
-    for metric_index, metric in enumerate(STRESS_METRICS):
+    for metric_index, metric in enumerate(EMBEDDING_STRESS_METRICS):
         points = []
         for coverage_index, coverage in enumerate(config.confidence_coverages or []):
             point = _accuracy_at_coverage(common_pairs, metric, coverage)
@@ -277,6 +330,35 @@ def _best_generated_index(
     return max(range(len(maxima)), key=maxima.__getitem__)
 
 
+@lru_cache(maxsize=None)
+def _reference_entries(path: str) -> Tuple[str, ...]:
+    return tuple(extract_entries(path)["reference"])
+
+
+def _text_scores(
+    generated: Sequence[str],
+    human: Sequence[str],
+    config: StressConfig,
+    bert_scorer: Optional[Any],
+) -> Dict[str, float]:
+    scores: Dict[str, float] = {}
+    if config.enable_entry_aware_rouge2:
+        scores["entry_aware_rouge2_f1"] = entry_aware_rouge_n_f1(
+            generated, human, 2
+        )
+    if config.enable_chunked_bertscore:
+        if bert_scorer is None:
+            raise RuntimeError("Chunked BERTScore is enabled but no scorer was loaded")
+        value, _ = _score_chunk_sets(
+            bert_scorer,
+            generated,
+            human,
+            config.text_metric_config(),
+        )
+        scores["chunked_bertscore_f1"] = value
+    return scores
+
+
 def _condition_record(
     target: SurveyTarget,
     attack: str,
@@ -285,6 +367,7 @@ def _condition_record(
     attacked_scores: Dict[str, float],
     original_count: int,
     added_count: int,
+    metrics: Sequence[str],
 ) -> Dict[str, Any]:
     return {
         "system": target.system,
@@ -296,18 +379,18 @@ def _condition_record(
         "severity": severity,
         "original_reference_count": original_count,
         "added_reference_count": added_count,
-        "base_scores": {metric: base_scores[metric] for metric in STRESS_METRICS},
+        "base_scores": {metric: base_scores[metric] for metric in metrics},
         "attacked_scores": {
-            metric: attacked_scores[metric] for metric in STRESS_METRICS
+            metric: attacked_scores[metric] for metric in metrics
         },
         "score_deltas": {
             metric: attacked_scores[metric] - base_scores[metric]
-            for metric in STRESS_METRICS
+            for metric in metrics
         },
     }
 
 
-def _distractor_vectors(
+def _distractor_items(
     chroma: ChromaBaselines,
     target: SurveyTarget,
     human: Sequence[Sequence[float]],
@@ -315,40 +398,51 @@ def _distractor_vectors(
     needed: int,
     config: StressConfig,
     rng: random.Random,
-) -> List[List[float]]:
+) -> List[Tuple[List[float], str]]:
     candidates = [
         other
         for other in other_targets
         if other.topic != target.topic and other.generated_file != target.generated_file
     ]
     rng.shuffle(candidates)
-    vectors: List[List[float]] = []
+    items: List[Tuple[List[float], str]] = []
     desired_pool = max(needed, needed * config.distractor_pool_multiplier)
     for source in candidates[: config.distractor_source_surveys]:
         source_generated, _ = _embeddings_for_target(chroma, source)
-        vectors.extend(source_generated)
-        if len(vectors) >= desired_pool:
+        source_entries = _reference_entries(source.generated_file)
+        if len(source_generated) != len(source_entries):
+            continue
+        items.extend(
+            (list(vector), entry)
+            for vector, entry in zip(source_generated, source_entries)
+        )
+        if len(items) >= desired_pool:
             break
-    if not vectors:
+    if not items:
         return []
     # Select the lowest-similarity cross-topic entries.  This is deliberately a
     # controlled contamination test and must not be described as naturally
     # occurring human-judged irrelevance.
-    matrix = chroma._cosine_matrix(vectors, human)
+    matrix = chroma._cosine_matrix([vector for vector, _ in items], human)
     ranked = sorted(
-        range(len(vectors)),
+        range(len(items)),
         key=lambda index: max(matrix[index]) if matrix[index] else 0.0,
     )
-    return [vectors[index] for index in ranked[:needed]]
+    return [items[index] for index in ranked[:needed]]
 
 
 def run_stress_tests(
     targets: Sequence[SurveyTarget],
     chroma: ChromaBaselines,
     config: StressConfig,
+    bert_scorer: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     records: List[Dict[str, Any]] = []
     diagnostics: Dict[str, int] = defaultdict(int)
+    metrics = _configured_stress_metrics(config)
+    text_metrics_enabled = (
+        config.enable_entry_aware_rouge2 or config.enable_chunked_bertscore
+    )
     for target_index, target in enumerate(
         tqdm(targets, desc="Reference metric stress tests", unit="survey")
     ):
@@ -357,13 +451,35 @@ def run_stress_tests(
             if not generated or not human:
                 diagnostics["missing_cached_embeddings"] += 1
                 continue
+            generated_entries = list(_reference_entries(target.generated_file))
+            human_entries = list(_reference_entries(target.human_file))
+            if text_metrics_enabled and (
+                len(generated_entries) != len(generated)
+                or len(human_entries) != len(human)
+            ):
+                diagnostics["text_embedding_count_mismatch"] += 1
+                continue
             base_scores = chroma._scores_from_embeddings(generated, human, "reference")
+            base_scores.update(
+                _text_scores(generated_entries, human_entries, config, bert_scorer)
+            )
             best_index = _best_generated_index(chroma, generated, human)
             for factor in config.duplication_factors or []:
                 added = [generated[best_index]] * (factor - 1)
                 attacked = list(generated) + added
                 attacked_scores = chroma._scores_from_embeddings(
                     attacked, human, "reference"
+                )
+                attacked_entries = generated_entries + [
+                    generated_entries[best_index]
+                ] * (factor - 1)
+                attacked_scores.update(
+                    _text_scores(
+                        attacked_entries,
+                        human_entries,
+                        config,
+                        bert_scorer,
+                    )
                 )
                 records.append(
                     _condition_record(
@@ -374,6 +490,7 @@ def run_stress_tests(
                         attacked_scores,
                         len(generated),
                         len(added),
+                        metrics,
                     )
                 )
 
@@ -383,7 +500,7 @@ def run_stress_tests(
                 default=0,
             )
             rng = random.Random(config.random_seed + target_index)
-            distractors = _distractor_vectors(
+            distractors = _distractor_items(
                 chroma,
                 target,
                 human,
@@ -400,7 +517,17 @@ def run_stress_tests(
                 if len(added) < count:
                     continue
                 attacked_scores = chroma._scores_from_embeddings(
-                    list(generated) + added, human, "reference"
+                    list(generated) + [vector for vector, _ in added],
+                    human,
+                    "reference",
+                )
+                attacked_scores.update(
+                    _text_scores(
+                        generated_entries + [entry for _, entry in added],
+                        human_entries,
+                        config,
+                        bert_scorer,
+                    )
                 )
                 records.append(
                     _condition_record(
@@ -411,6 +538,7 @@ def run_stress_tests(
                         attacked_scores,
                         len(generated),
                         len(added),
+                        metrics,
                     )
                 )
             diagnostics["evaluated_surveys"] += 1
@@ -442,14 +570,17 @@ def _summarize_values(values: Sequence[float]) -> Dict[str, Any]:
     }
 
 
-def summarize_stress(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_stress(
+    records: Sequence[Dict[str, Any]], metrics: Optional[Sequence[str]] = None
+) -> Dict[str, Any]:
+    selected_metrics = tuple(metrics or STRESS_METRICS)
     grouped: Dict[Tuple[str, float, str], List[float]] = defaultdict(list)
     per_target: Dict[Tuple[str, str], Dict[float, Dict[str, float]]] = defaultdict(dict)
     for record in records:
         attack = str(record["attack"])
         severity = float(record["severity"])
         target_key = str(record["generated_file"])
-        for metric in STRESS_METRICS:
+        for metric in selected_metrics:
             delta = float(record["score_deltas"][metric])
             grouped[(attack, severity, metric)].append(delta)
             per_target[(attack, target_key)].setdefault(severity, {})[metric] = float(
@@ -464,7 +595,7 @@ def summarize_stress(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     monotonic: Dict[str, Dict[str, Any]] = {}
     for attack in sorted({key[0] for key in per_target}):
-        for metric in STRESS_METRICS:
+        for metric in selected_metrics:
             checks: List[bool] = []
             for (candidate_attack, _), by_severity in per_target.items():
                 if candidate_attack != attack:
@@ -522,8 +653,16 @@ def main() -> None:
     quantitative = _merge_quantitative_results(meta_config.quantitative_result_files)
     targets = _targets_from_meta(meta_result, quantitative, config)
     chroma = ChromaBaselines(meta_config.chroma_db_dir, meta_config)
+    bert_scorer = (
+        _build_scorer(config.text_metric_config())
+        if config.enable_chunked_bertscore
+        else None
+    )
+    stress_metrics = _configured_stress_metrics(config)
 
-    records, diagnostics = run_stress_tests(targets, chroma, config)
+    records, diagnostics = run_stress_tests(
+        targets, chroma, config, bert_scorer=bert_scorer
+    )
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "config": asdict(config),
@@ -542,10 +681,24 @@ def main() -> None:
                 "Stress tests evaluate monotonicity and resistance to metric "
                 "gaming; they do not measure expert correlation."
             ),
+            "text_embedding_alignment": (
+                "Reference texts are paired with cached embeddings by their "
+                "original processed-file order; targets with count mismatches "
+                "are excluded and reported in stress_diagnostics."
+            ),
+            "bertscore_aggregation": (
+                "Long reference lists are split at entry boundaries; "
+                "candidate-side precision and human-side recall are max-matched "
+                "across chunks and combined as F1."
+                if config.enable_chunked_bertscore
+                else None
+            ),
         },
+        "stress_metrics": list(stress_metrics),
+        "bertscore_hash": getattr(bert_scorer, "hash", None),
         "accuracy_coverage": accuracy_coverage_report(meta_result, config),
         "stress_diagnostics": diagnostics,
-        "stress_summary": summarize_stress(records),
+        "stress_summary": summarize_stress(records, stress_metrics),
         "stress_records": records,
     }
     output = Path(config.output_path)

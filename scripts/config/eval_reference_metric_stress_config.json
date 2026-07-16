@@ -1,7 +1,7 @@
 {
   "meta_config_path": "scripts/config/eval_metric_meta_config.json",
   "meta_result_path": "results/meta_evaluation/metric_meta_same_backbone.json",
-  "output_path": "results/meta_evaluation/reference_metric_stress.json",
+  "output_path": "results/meta_evaluation/reference_metric_stress_extended.json",
 
   "categories": ["Computer Science"],
   "systems": null,
@@ -15,5 +15,16 @@
   "random_seed": 42,
 
   "bootstrap_samples": 10000,
-  "confidence_coverages": [0.2, 0.4, 0.6, 0.8, 1.0]
+  "confidence_coverages": [0.2, 0.4, 0.6, 0.8, 1.0],
+
+  "enable_entry_aware_rouge2": true,
+  "enable_chunked_bertscore": true,
+  "bertscore_model_type": "roberta-large",
+  "bertscore_lang": "en",
+  "bertscore_num_layers": null,
+  "bertscore_batch_size": 16,
+  "bertscore_device": null,
+  "bertscore_rescale_with_baseline": false,
+  "bertscore_use_fast_tokenizer": false,
+  "chunk_max_words": 200
 }
